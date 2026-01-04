@@ -1,0 +1,8 @@
+# Backend env file
+backend/.env
+backend/.env.local
+
+# Python stuff
+backend/venv/
+backend/__pycache__/
+FLASK_ENV=development
