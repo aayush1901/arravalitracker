@@ -15,7 +15,7 @@ function App() {
   // 1. Fetch standard mining map on year change
   const fetchMap = async () => {
     try {
-      const res = await axios.get(`http://localhost:5000/get_mining_map?year=${year}`);
+      const res = await axios.get(`https://clapped-dorene-alliteratively.ngrok-free.dev/get_mining_map?year=${year}`);
       setTileUrl(res.data.tile_url);
     } catch (err) { console.error("Map Fetch Error", err); }
   };
@@ -25,7 +25,7 @@ function App() {
     setLoading(true);
     setHotspots([]);
     try {
-      const res = await axios.get(`http://localhost:5000/get_ai_prediction`);
+      const res = await axios.get(`https://clapped-dorene-alliteratively.ngrok-free.dev/get_ai_prediction`);
       if (res.data.tile_url) setTileUrl(res.data.tile_url);
       setHotspots(res.data.critical_points || []);
     } catch (err) { console.error("AI Analysis Error", err); }
@@ -37,7 +37,7 @@ function App() {
     setBriefLoading(true);
     setSelectedBrief({ lat, lng, report: "" }); // Open modal in loading state
     try {
-      const res = await axios.get(`http://localhost:5000/get_gemini_report?lat=${lat}&lng=${lng}`);
+      const res = await axios.get(`https://clapped-dorene-alliteratively.ngrok-free.dev/get_gemini_report?lat=${lat}&lng=${lng}`);
       setSelectedBrief({ lat, lng, report: res.data.report });
     } catch (err) {
       console.error("Gemini Error", err);
