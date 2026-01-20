@@ -1,68 +1,18 @@
 import ee
 import flask
 from flask_cors import CORS
-import logging
 import dotenv
 import os
-
-# ---------- ONLY ADDITION (dotenv load) ----------
-dotenv.load_dotenv()   # loads .env from current working directory
-# -----------------------------------------------
-
-app = flask.Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
-
-
 from google import genai
 from google.genai import types
 
-# ---------- ONLY ADDITION (read env vars) ----------
+dotenv.load_dotenv()
+app = flask.Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}})
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PROJECT_ID = os.getenv("PROJECT_ID")
-
-print("GEMINI_API_KEY loaded:", bool(GEMINI_API_KEY))
-print("PROJECT_ID loaded:", PROJECT_ID)
-# -------------------------------------------------
-
-# Initialize client
 client = genai.Client(api_key=GEMINI_API_KEY)
-
-@app.route('/get_gemini_report')
-def get_gemini_report():
-    lat = flask.request.args.get('lat')
-    lng = flask.request.args.get('lng')
-    
-    system_instr = (
-        "You are a Senior Environmental Scientist and Enforcement Officer. "
-        "Your task is to analyze environmental threats in the Aravalli Range."
-    )
-    
-    user_prompt = f"""
-    COORDINATES: Latitude {lat}, Longitude {lng}
-    
-    TASKS:
-    1. Identify specific factors causing soil erosion at this location based on its Aravalli geography.
-    2. Judge and report the meteorological (weather) vulnerabilities for this coordinate.
-    3. Recommend the best strategic options to stop mining and stabilize the terrain.
-    
-    FORMAT: Use bullet points for the weather and action plan.
-    """
-
-    response = client.models.generate_content(
-        model="gemini-2.5-flash-lite",
-        config=types.GenerateContentConfig(
-            system_instruction=system_instr,
-            temperature=0.3
-        ),
-        contents=user_prompt
-    )
-    
-    return {"report": response.text}
-
-# Replace with your actual Project ID from Google Cloud Console
-# ---------- ONLY FIX (use env value instead of self-reference) ----------
-PROJECT_ID = PROJECT_ID
-# ---------------------------------------------------------------------
 
 try:
     ee.Initialize(project=PROJECT_ID)
@@ -70,24 +20,99 @@ try:
 except Exception as e:
     print(f"EE Initialization Failed: {e}")
 
+def add_size_property(f):
+    return f.set('size', f.get('count'))
+
+# Helper Functions
+def get_s2_composite(year, region):
+    return ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
+            .filterBounds(region) \
+            .filterDate(f'{year}-01-01', f'{year}-12-31') \
+            .median()
+
+def get_clean_bsi(img):
+    bsi = img.expression(
+        '((B11 + B4) - (B8 + B2)) / ((B11 + B4) + (B8 + B2))',
+        {'B11': img.select('B11'), 'B4': img.select('B4'),
+         'B8': img.select('B8'), 'B2': img.select('B2')}
+    )
+    ndwi = img.normalizedDifference(['B3', 'B8'])
+    return bsi.updateMask(ndwi.lt(0.2))
+
+# --- ROUTES ---
+
+@app.route('/get_gemini_report')
+def get_gemini_report():
+    try:
+        lat, lng = flask.request.args.get('lat'), flask.request.args.get('lng')
+        mode = flask.request.args.get('mode', 'mining')
+        
+        # Dynamic instruction based on mode
+        if mode == 'forest':
+            sys_msg = "You are a Forest Conservation Officer."
+            user_msg = f"Report on forest loss and canopy reduction at Lat: {lat}, Lng: {lng}."
+        elif mode == 'landslide':
+            sys_msg = "You are a Disaster Management Specialist."
+            user_msg = f"Analyze landslide risk due to slope instability and vegetation loss at Lat: {lat}, Lng: {lng}."
+        else:
+            sys_msg = "You are a Senior Mining Inspector."
+            user_msg = f"Report on illegal mining excavation at Lat: {lat}, Lng: {lng}."
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite", 
+            config=types.GenerateContentConfig(system_instruction=sys_msg, temperature=0.3),
+            contents=user_msg
+        )
+        return {"report": response.text}
+    except Exception as e:
+        return {"report": f"AI Error: {str(e)}"}, 500
+
 @app.route('/get_mining_map')
 def get_mining_map():
     try:
         year = int(flask.request.args.get('year', 2024))
-        region = ee.Geometry.Rectangle([76.5, 27.5, 77.5, 28.5])
+        bounds_raw = flask.request.args.get('bounds')
+        region = ee.Geometry.Rectangle([float(x) for x in bounds_raw.split(',')]) if bounds_raw else ee.Geometry.Rectangle([76.5, 27.5, 77.5, 28.5])
         
-        img = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
-                .filterBounds(region) \
-                .filterDate(f'{year}-01-01', f'{year}-12-31') \
-                .median()
+        img = get_s2_composite(year, region)
+        bsi = get_clean_bsi(img)
+        mining_mask = bsi.gt(0.18) 
+        map_id = bsi.updateMask(mining_mask).getMapId({'min': 0.18, 'max': 0.3, 'palette': ["#ffff00", '#ff8800', '#ff0000']})
+        return {"tile_url": map_id['tile_fetcher'].url_format}
+    except Exception as e:
+        return {"error": str(e)}, 500
 
-        bsi = img.expression(
-            '((B11 + B4) - (B8 + B2)) / ((B11 + B4) + (B8 + B2))', {
-                'B11': img.select('B11'), 'B4': img.select('B4'),
-                'B8': img.select('B8'), 'B2': img.select('B2')
-            })
+@app.route('/get_forest_change')
+def get_forest_change():
+    try:
+        year_now = int(flask.request.args.get('year', 2024))
+        year_ref = int(flask.request.args.get('refYear', 2016)) # FIXED: Now uses slider
+        bounds_raw = flask.request.args.get('bounds')
+        region = ee.Geometry.Rectangle([float(x) for x in bounds_raw.split(',')]) if bounds_raw else ee.Geometry.Rectangle([76.5, 27.5, 77.5, 28.5])
+        
+        img_past = get_s2_composite(year_ref, region)
+        img_now = get_s2_composite(year_now, region)
+        diff = img_now.normalizedDifference(['B8', 'B4']).subtract(img_past.normalizedDifference(['B8', 'B4']))
+        
+        loss, gain = diff.lt(-0.15).selfMask(), diff.gt(0.15).selfMask()
+        change_layer = ee.ImageCollection([loss.visualize(palette=['#ff0000']), gain.visualize(palette=['#00ff00'])]).mosaic()
+        return {"tile_url": change_layer.getMapId()['tile_fetcher'].url_format}
+    except Exception as e:
+        return {"error": str(e)}, 500
 
-        map_id = bsi.getMapId({'min': 0, 'max': 0.3, 'palette': ['green', 'yellow', 'orange', 'red']})
+@app.route('/get_landslide_risk')
+def get_landslide_risk():
+    try:
+        year_now = int(flask.request.args.get('year', 2024))
+        year_ref = int(flask.request.args.get('refYear', 2016))
+        bounds_raw = flask.request.args.get('bounds')
+        region = ee.Geometry.Rectangle([float(x) for x in bounds_raw.split(',')]) if bounds_raw else ee.Geometry.Rectangle([76.5, 27.5, 77.5, 28.5])
+
+        slope = ee.Terrain.slope(ee.Image("USGS/SRTMGL1_003"))
+        ndvi_diff = get_s2_composite(year_now, region).normalizedDifference(['B8', 'B4']).subtract(get_s2_composite(year_ref, region).normalizedDifference(['B8', 'B4']))
+
+        risk_score = slope.gt(15).add(ndvi_diff.lt(-0.1).multiply(2)) 
+        map_id = risk_score.updateMask(slope.gt(15)).getMapId({'min': 1, 'max': 3, 'palette': ['#ffff00', '#ffaa00', '#ff0000']})
         return {"tile_url": map_id['tile_fetcher'].url_format}
     except Exception as e:
         return {"error": str(e)}, 500
@@ -95,53 +120,31 @@ def get_mining_map():
 @app.route('/get_ai_prediction')
 def get_ai_prediction():
     try:
-        region = ee.Geometry.Rectangle([76.5, 27.5, 77.5, 28.5])
-        
-        now = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(region).filterDate('2024-01-01', '2024-12-31').median()
-        past = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(region).filterDate('2022-01-01', '2022-12-31').median()
+        year_now = int(flask.request.args.get('year', 2024))
+        year_ref = int(flask.request.args.get('refYear', 2016))
+        bounds_raw = flask.request.args.get('bounds')
+        region = ee.Geometry.Rectangle([float(x) for x in bounds_raw.split(',')]) if bounds_raw else ee.Geometry.Rectangle([76.5, 27.5, 77.5, 28.5])
 
-        def get_bsi(img):
-            return img.expression(
-                '((B11 + B4) - (B8 + B2)) / ((B11 + B4) + (B8 + B2))',
-                {'B11': img.select('B11'), 'B4': img.select('B4'),
-                 'B8': img.select('B8'), 'B2': img.select('B2')}
-            )
+        # Analysis
+        diff = get_clean_bsi(get_s2_composite(year_now, region)).subtract(get_clean_bsi(get_s2_composite(year_ref, region))).gt(0.1)
+        vectors = diff.selfMask().reduceToVectors(geometry=region, scale=500, geometryType='centroid', maxPixels=1e8, bestEffort=True)
 
-        diff = get_bsi(now).subtract(get_bsi(past)).gt(0.05)
+        # FIXED: Using named function instead of lambda
+        final_points = vectors.map(add_size_property).sort('size', False).limit(5)
         
-        vectors = diff.selfMask().reduceToVectors(
-            geometry=region,
-            scale=200,
-            geometryType='centroid',
-            maxPixels=1e8
-        ).limit(5)
-        
-        features = vectors.getInfo()['features']
-        coords_list = []
-
-        for f in features:
-            c = f['geometry']['coordinates']
-            coords_list.append({"lat": c[1], "lng": c[0], "status": "CRITICAL EXCAVATION"})
+        features = final_points.getInfo().get('features', [])
+        coords_list = [{"lat": f['geometry']['coordinates'][1], "lng": f['geometry']['coordinates'][0], "status": f"MAJOR RISK (Size: {f['properties']['size']})"} for f in features]
 
         if not coords_list:
-            coords_list = [
-                {"lat": 28.1245, "lng": 76.9856, "status": "PREDICTIVE RISK: ZONE A"},
-                {"lat": 27.9567, "lng": 77.1023, "status": "PREDICTIVE RISK: ZONE B"}
-            ]
+            c = region.centroid().getInfo()['coordinates']
+            coords_list = [{"lat": c[1], "lng": c[0], "status": "SCAN COMPLETE: NO ANOMALIES"}]
 
-        map_id = diff.updateMask(diff).getMapId({'palette': ['#ff00ff']})
-        
-        return {
-            "tile_url": map_id['tile_fetcher'].url_format,
-            "critical_points": coords_list
-        }
-
+        # FIXED: Added format: 'png' for better transparency in Leaflet
+        map_id = diff.updateMask(diff).getMapId({'palette': ['#ff00ff'], 'format': 'png'})
+        return {"tile_url": map_id['tile_fetcher'].url_format, "critical_points": coords_list}
     except Exception as e:
-        logging.error(f"AI Prediction Error: {e}")
-        return {
-            "tile_url": "",
-            "critical_points": [{"lat": 28.0, "lng": 77.0, "status": "DEMO MODE: RECHECK API"}]
-        }, 200
+        print(f"Prediction Error: {e}")
+        return {"tile_url": "", "critical_points": []}, 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
